@@ -269,7 +269,7 @@ func ping(account Account, userAgent string) {
 			"username":     account.Auth.Email,
 			"extensionid":  "fpdkjdnhkakefebpekbdhillbhonfjjp",
 			"numberoftabs": 0,
-			"_v":           "1.0.7",
+			"_v":           "1.0.9",
 		}
 
 		res, err := client.R().
