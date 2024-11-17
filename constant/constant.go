@@ -1,9 +1,15 @@
 package constant
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 const (
-	BaseUrl = "https://www.aeropres.in/chromeapi/dawn/v1"
+	BaseUrl       = "https://www.aeropres.in/chromeapi/dawn/v1"
+	MaxRetries    = 10
+	RetryInterval = 5 * time.Second
+	TwoCaptchaURL = "https://api.2captcha.com"
 )
 
 var (

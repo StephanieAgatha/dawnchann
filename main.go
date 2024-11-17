@@ -8,20 +8,21 @@ import (
 	"dawnchann/request"
 	"encoding/json"
 	"fmt"
-	"github.com/go-resty/resty/v2"
-	"github.com/go-telegram/bot"
-	"github.com/go-telegram/bot/models"
 	browser "github.com/itzngga/fake-useragent"
 	"github.com/joho/godotenv"
-	"github.com/mattn/go-colorable"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"log"
 	"math"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-resty/resty/v2"
+	"github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
+	"github.com/mattn/go-colorable"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var logger *zap.Logger
@@ -29,6 +30,7 @@ var logger *zap.Logger
 type Account struct {
 	Auth    request.Authentication
 	Proxies []string
+	Token   string
 }
 
 type ProxyConfig struct {
@@ -87,6 +89,23 @@ func NewProxyDistributor(userIDs, proxies []string, logger *zap.Logger) *ProxyDi
 		proxies: proxies,
 		logger:  logger,
 	}
+}
+
+type SessionExpiredError struct {
+	Message string
+}
+
+func (e *SessionExpiredError) Error() string {
+	return e.Message
+}
+
+// if we got session expired err
+func isSessionExpired(response string) bool {
+	if strings.Contains(response, "session expired") ||
+		strings.Contains(response, "Please login again") {
+		return true
+	}
+	return false
 }
 
 func parseLoginFile(path string) ([]string, []request.Authentication, error) {
@@ -189,6 +208,350 @@ func readProxies(path string) ([]string, error) {
 	return proxies, scanner.Err()
 }
 
+// get puzzle
+func getPuzzleID(userAgent string) (string, error) {
+	client := resty.New().
+		SetTimeout(30 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(5 * time.Second).
+		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetHeaders(map[string]string{
+			"accept":          "*/*",
+			"accept-language": "en-US,en;q=0.9",
+			"user-agent":      userAgent,
+		})
+
+	resp, err := client.R().
+		Get("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle?appid=undefined")
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get puzzle: %v", err)
+	}
+
+	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	}
+
+	var puzzleResp request.PuzzleResponse
+	if err := json.Unmarshal(resp.Body(), &puzzleResp); err != nil {
+		return "", fmt.Errorf("failed to parse puzzle response: %v", err)
+	}
+
+	if !puzzleResp.Success {
+		return "", fmt.Errorf("puzzle request unsuccessful")
+	}
+
+	logger.Info("Puzzle ID obtained", zap.String("id", puzzleResp.PuzzleID))
+	return puzzleResp.PuzzleID, nil
+}
+
+func getPuzzleImage(puzzleID, userAgent string) (string, error) {
+	client := resty.New().
+		SetTimeout(30 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(5 * time.Second).
+		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetHeaders(map[string]string{
+			"accept":          "*/*",
+			"accept-language": "en-US,en;q=0.9",
+			"user-agent":      userAgent,
+		})
+
+	url := fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle-image?puzzle_id=%s&appid=undefined", puzzleID)
+	resp, err := client.R().Get(url)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get puzzle image: %v", err)
+	}
+
+	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	}
+
+	var imageResp request.PuzzleImageResponse
+	if err := json.Unmarshal(resp.Body(), &imageResp); err != nil {
+		return "", fmt.Errorf("failed to parse image response: %v", err)
+	}
+
+	if !imageResp.Success {
+		return "", fmt.Errorf("image request unsuccessful")
+	}
+
+	logger.Info("Puzzle image obtained")
+	return imageResp.ImgBase64, nil
+}
+
+// solve puzzle
+func solvePuzzle(email string) (string, string, error) {
+	userAgent := browser.MacOSX()
+
+	puzzleID, err := getPuzzleID(userAgent)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get puzzle: %v", err)
+	}
+
+	imgBase64, err := getPuzzleImage(puzzleID, userAgent)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get puzzle image: %v", err)
+	}
+
+	twoCaptchaKey := os.Getenv("TWOCAPTCHA_KEY")
+	taskID, err := createCaptchaTask(twoCaptchaKey, imgBase64)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create captcha task: %v", err)
+	}
+
+	solution, err := getCaptchaResult(twoCaptchaKey, taskID)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get captcha result: %v", err)
+	}
+
+	logger.Info("Puzzle solved successfully",
+		zap.String("account", email),
+		zap.String("solution", solution))
+
+	return puzzleID, solution, nil
+}
+
+// captcha logic
+func createCaptchaTask(apiKey, imgBase64 string) (int64, error) {
+	payload := request.CreateTaskRequest{
+		ClientKey: apiKey,
+		SoftID:    4706,
+		Task: request.Task{
+			Type:      "ImageToTextTask",
+			Body:      imgBase64,
+			Phrase:    false,
+			Case:      false,
+			Numeric:   0,
+			Math:      false,
+			MinLength: 0,
+			MaxLength: 0,
+			Comment:   "Pay close attention to the letter case.",
+		},
+	}
+
+	client := resty.New().
+		SetTimeout(30 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(5 * time.Second)
+
+	resp, err := client.R().
+		SetBody(payload).
+		Post(constant.TwoCaptchaURL + "/createTask")
+
+	if err != nil {
+		return 0, fmt.Errorf("failed to create captcha task: %v", err)
+	}
+
+	if resp.StatusCode() != 200 {
+		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	}
+
+	var result request.CreateTaskResponse
+	if err := json.Unmarshal(resp.Body(), &result); err != nil {
+		return 0, fmt.Errorf("failed to parse create task response: %v", err)
+	}
+
+	if result.ErrorID != 0 {
+		return 0, fmt.Errorf("2captcha error: %d", result.ErrorID)
+	}
+
+	logger.Info("Captcha task created", zap.Int64("taskId", result.TaskID))
+	return result.TaskID, nil
+}
+
+func getCaptchaResult(apiKey string, taskID int64) (string, error) {
+	payload := request.GetResultRequest{
+		ClientKey: apiKey,
+		TaskID:    taskID,
+	}
+
+	client := resty.New().
+		SetTimeout(30 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(5 * time.Second)
+
+	for attempt := 0; attempt < constant.MaxRetries; attempt++ {
+		resp, err := client.R().
+			SetBody(payload).
+			Post(constant.TwoCaptchaURL + "/getTaskResult")
+
+		if err != nil {
+			return "", fmt.Errorf("failed to get captcha result: %v", err)
+		}
+
+		if resp.StatusCode() != 200 {
+			return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+		}
+
+		var result request.GetResultResponse
+		if err := json.Unmarshal(resp.Body(), &result); err != nil {
+			return "", fmt.Errorf("failed to parse result response: %v", err)
+		}
+
+		if result.ErrorID != 0 {
+			return "", fmt.Errorf("2captcha error: %d", result.ErrorID)
+		}
+
+		if result.Status == "ready" {
+			logger.Info("Captcha solved", zap.String("text", result.Solution.Text))
+			return result.Solution.Text, nil
+		}
+
+		if attempt < constant.MaxRetries-1 {
+			logger.Info("Captcha still processing, waiting...",
+				zap.Int("attempt", attempt+1),
+				zap.Int("maxAttempts", constant.MaxRetries))
+			time.Sleep(constant.RetryInterval)
+		}
+	}
+
+	return "", fmt.Errorf("captcha solving timed out after %d attempts", constant.MaxRetries)
+}
+
+// login
+func isBadGateway(statusCode int, body string) bool {
+	return statusCode == 502 || strings.Contains(body, "502 Bad Gateway")
+}
+
+func processLogin(account *Account) error {
+	maxRetries := 10
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		puzzleID, solution, err := solvePuzzle(account.Auth.Email)
+		if err != nil {
+			logger.Error("Failed to solve puzzle",
+				zap.String("email", account.Auth.Email),
+				zap.Int("attempt", attempt+1),
+				zap.Error(err))
+
+			if attempt < maxRetries-1 {
+				time.Sleep(3 * time.Second)
+				continue
+			}
+			return fmt.Errorf("failed to solve puzzle after %d attempts: %v", maxRetries, err)
+		}
+
+		token, err := loginDawn(
+			account.Auth.Email,
+			account.Auth.Password,
+			puzzleID,
+			solution,
+			browser.Chrome(),
+		)
+
+		if err != nil {
+			if strings.Contains(err.Error(), "Invalid username or Password") {
+				return &InvalidCredentialsError{Email: account.Auth.Email}
+			}
+
+			if strings.Contains(err.Error(), "502 Bad Gateway") {
+				logger.Warn("Received 502 Bad Gateway",
+					zap.String("email", account.Auth.Email),
+					zap.Int("attempt", attempt+1))
+
+				if attempt < maxRetries-1 {
+					logger.Info("Waiting before retry...",
+						zap.String("email", account.Auth.Email),
+						zap.Int("nextAttempt", attempt+2))
+					time.Sleep(3 * time.Second)
+					continue
+				}
+			} else if strings.Contains(err.Error(), "Incorrect answer") {
+				logger.Warn("Incorrect puzzle answer",
+					zap.String("email", account.Auth.Email),
+					zap.Int("attempt", attempt+1),
+					zap.String("solution", solution))
+
+				if attempt < maxRetries-1 {
+					time.Sleep(2 * time.Second)
+					continue
+				}
+			}
+
+			return fmt.Errorf("login failed after %d attempts: %v", attempt+1, err)
+		}
+
+		account.Token = token
+		logger.Info("Login completed",
+			zap.String("email", account.Auth.Email),
+			zap.Int("attemptsTaken", attempt+1))
+
+		return nil
+	}
+
+	return fmt.Errorf("exceeded maximum retry attempts (%d)", maxRetries)
+}
+
+func loginDawn(email, password, puzzleID, captchaSolution, userAgent string) (string, error) {
+	loginPayload := request.LoginRequest{
+		Username: email,
+		Password: password,
+		LoginData: request.LoginData{
+			Version:  "1.0.9",
+			DateTime: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+		},
+		PuzzleID: puzzleID,
+		Answer:   captchaSolution,
+	}
+
+	client := resty.New().
+		SetTimeout(30 * time.Second).
+		SetRetryCount(3).
+		SetRetryWaitTime(5 * time.Second).
+		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetHeaders(map[string]string{
+			"accept":          "*/*",
+			"accept-language": "en-US,en;q=0.9",
+			"content-type":    "application/json",
+			"user-agent":      userAgent,
+		})
+
+	resp, err := client.R().
+		SetBody(loginPayload).
+		Post("https://www.aeropres.in/chromeapi/dawn/v1/user/login/v2?appid=undefined")
+
+	if err != nil {
+		return "", fmt.Errorf("login request failed: %v", err)
+	}
+
+	// 502 err case
+	if isBadGateway(resp.StatusCode(), resp.String()) {
+		return "", fmt.Errorf("502 Bad Gateway received")
+	}
+
+	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
+		var errorResp struct {
+			Success bool   `json:"success"`
+			Message string `json:"message"`
+			MsgCode int    `json:"msgcode"`
+		}
+
+		if err := json.Unmarshal(resp.Body(), &errorResp); err != nil {
+			return "", fmt.Errorf("login failed with status code: %d, body: %s",
+				resp.StatusCode(), resp.String())
+		}
+
+		return "", fmt.Errorf("%s", errorResp.Message)
+	}
+
+	var loginResp request.LoginResponse
+	if err := json.Unmarshal(resp.Body(), &loginResp); err != nil {
+		return "", fmt.Errorf("failed to parse login response: %v", err)
+	}
+
+	if !loginResp.Status {
+		return "", fmt.Errorf("%s", loginResp.Message)
+	}
+
+	logger.Info("Login successful",
+		zap.String("email", email),
+		zap.String("serverName", loginResp.ServerName))
+
+	return loginResp.Data.Token, nil
+}
+
 func calculateTotalPoints(jsonResponse string) (float64, error) {
 	var response request.PointResponse
 	err := json.Unmarshal([]byte(jsonResponse), &response)
@@ -210,6 +573,19 @@ func calculateTotalPoints(jsonResponse string) (float64, error) {
 		response.Data.ReferralPoint.Commission
 
 	return totalPoints, nil
+}
+
+// credential checkkk
+type InvalidCredentialsError struct {
+	Email string
+}
+
+func (e *InvalidCredentialsError) Error() string {
+	return fmt.Sprintf("Invalid credentials for %s", e.Email)
+}
+
+func isInvalidCredentials(err error) bool {
+	return strings.Contains(err.Error(), "Invalid username or Password")
 }
 
 func cleanResponse(response string) string {
@@ -249,6 +625,8 @@ func humanizeFloat(f float64) string {
 
 func ping(account Account, userAgent string) {
 	currentProxyIndex := 0
+	maxRetries := 5
+
 	for {
 		proxy := account.Proxies[currentProxyIndex]
 		currentProxyIndex = (currentProxyIndex + 1) % len(account.Proxies)
@@ -273,28 +651,91 @@ func ping(account Account, userAgent string) {
 		}
 
 		res, err := client.R().
-			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Auth.Password)).
+			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
 			SetBody(keepAliveRequest).
 			Post(constant.KeepAliveURL)
+
 		if err != nil {
 			logger.Error("Keep alive error",
 				zap.String("acc", account.Auth.Email),
 				zap.Error(err))
 		} else {
+			response := res.String()
+			if isSessionExpired(response) {
+				logger.Warn("Session expired, attempting to relogin",
+					zap.String("acc", account.Auth.Email))
+
+				// attempt relogin
+				for retry := 0; retry < maxRetries; retry++ {
+					err := processLogin(&account)
+					if err != nil {
+						logger.Error("Relogin attempt failed",
+							zap.String("acc", account.Auth.Email),
+							zap.Int("attempt", retry+1),
+							zap.Int("maxAttempts", maxRetries),
+							zap.Error(err))
+
+						if retry < maxRetries-1 {
+							time.Sleep(3 * time.Second)
+							continue
+						}
+						break
+					}
+
+					logger.Info("Relogin successful",
+						zap.String("acc", account.Auth.Email),
+						zap.Int("attemptsTaken", retry+1))
+					break
+				}
+				continue
+			}
+
 			logger.Info("Keep alive success",
 				zap.String("acc", account.Auth.Email),
-				zap.String("res", cleanResponse(res.String())))
+				zap.String("res", cleanResponse(response)))
 		}
 
+		// get points
 		res, err = client.R().
-			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Auth.Password)).
+			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
 			Get(constant.GetPointURL)
+
 		if err != nil {
 			logger.Error("Get point error",
 				zap.String("acc", account.Auth.Email),
 				zap.Error(err))
 		} else {
-			points, err := calculateTotalPoints(res.String())
+			response := res.String()
+			if isSessionExpired(response) {
+				logger.Warn("Session expired during points check, attempting to relogin",
+					zap.String("acc", account.Auth.Email))
+
+				// attempt relogin
+				for retry := 0; retry < maxRetries; retry++ {
+					err := processLogin(&account)
+					if err != nil {
+						logger.Error("Relogin attempt failed during points check",
+							zap.String("acc", account.Auth.Email),
+							zap.Int("attempt", retry+1),
+							zap.Int("maxAttempts", maxRetries),
+							zap.Error(err))
+
+						if retry < maxRetries-1 {
+							time.Sleep(3 * time.Second)
+							continue
+						}
+						break
+					}
+
+					logger.Info("Relogin successful after points check error",
+						zap.String("acc", account.Auth.Email),
+						zap.Int("attemptsTaken", retry+1))
+					break
+				}
+				continue
+			}
+
+			points, err := calculateTotalPoints(response)
 			if err != nil {
 				logger.Error("Error calculating points",
 					zap.String("acc", account.Auth.Email),
@@ -482,6 +923,7 @@ func main() {
 		zapcore.DebugLevel,
 	))
 
+	// load .env file
 	if err := godotenv.Load(); err != nil {
 		logger.Fatal("Error loading .env file", zap.Error(err))
 	}
@@ -491,23 +933,33 @@ func main() {
 		logger.Fatal("BOT_TOKEN not found in .env")
 	}
 
+	twoCaptchaKey := os.Getenv("TWOCAPTCHA_KEY")
+	if twoCaptchaKey == "" {
+		logger.Fatal("TWOCAPTCHA_KEY not found in .env")
+	}
+
+	// read login.txt
 	userIDs, auths, err := parseLoginFile("login.txt")
 	if err != nil {
 		logger.Fatal("Error parsing login file", zap.Error(err))
 	}
 
+	// read proxies
 	proxies, err := readProxies("proxy.txt")
 	if err != nil {
 		logger.Fatal("Error reading proxy file", zap.Error(err))
 	}
 
+	// proxy distributor
 	distributor := NewProxyDistributor(userIDs, proxies, logger)
 	if err := distributor.Validate(); err != nil {
 		logger.Fatal("Proxy distribution validation failed", zap.Error(err))
 	}
 
+	// get proxy distribution
 	proxyDistribution := distributor.DistributeProxies()
 
+	// create accounts with distributed proxies
 	var accounts []Account
 	for i, auth := range auths {
 		accounts = append(accounts, Account{
@@ -516,20 +968,78 @@ func main() {
 		})
 	}
 
+	logger.Info("Initial setup complete",
+		zap.Int("totalAccounts", len(accounts)),
+		zap.Int("totalProxies", len(proxies)))
+
+	var successfulLogins int
+	var skippedAccounts int
+	for i := range accounts {
+		logger.Info("Processing account...",
+			zap.String("email", accounts[i].Auth.Email),
+			zap.Int("current", i+1),
+			zap.Int("total", len(accounts)))
+
+		err := processLogin(&accounts[i])
+		if err != nil {
+			if isInvalidCredentials(err) {
+				logger.Error("Skipping account due to invalid credentials",
+					zap.String("email", accounts[i].Auth.Email))
+				skippedAccounts++
+				continue // skip to next acc
+			}
+
+			logger.Error("Failed to process login",
+				zap.String("email", accounts[i].Auth.Email),
+				zap.Error(err))
+			continue
+		}
+
+		successfulLogins++
+		logger.Info("Account login successful",
+			zap.String("email", accounts[i].Auth.Email),
+			zap.Int("successfulLogins", successfulLogins),
+			zap.Int("totalAccounts", len(accounts)))
+	}
+
+	// log final summary
+	logger.Info("Login process completed",
+		zap.Int("totalAccounts", len(accounts)),
+		zap.Int("successfulLogins", successfulLogins),
+		zap.Int("skippedAccounts", skippedAccounts))
+
+	if successfulLogins == 0 {
+		logger.Fatal("No accounts were successfully logged in")
+	}
+
+	// init telegram bot
 	b, err := bot.New(botToken)
 	if err != nil {
 		logger.Fatal("Error creating bot", zap.Error(err))
 	}
 
+	// regist telegram handlers
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, handleStart)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/point", bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		handlePoint(ctx, b, update, accounts)
 	})
 
-	browserRand := browser.Chrome()
+	// start ping routines only for accounts with valid tokens
+	logger.Info("Starting ping routines",
+		zap.Int("successfulLogins", successfulLogins))
+
 	for _, account := range accounts {
-		go ping(account, browserRand)
+		if account.Token != "" {
+			go func(acc Account) {
+				userAgent := browser.Chrome()
+				logger.Info("Starting ping routine",
+					zap.String("email", acc.Auth.Email))
+				ping(acc, userAgent)
+			}(account)
+		}
 	}
 
+	// start tele bot
+	logger.Info("Starting Telegram bot")
 	b.Start(context.Background())
 }
