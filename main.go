@@ -28,9 +28,10 @@ import (
 var logger *zap.Logger
 
 type Account struct {
-	Auth    request.Authentication
-	Proxies []string
-	Token   string
+	Auth       request.Authentication
+	Proxies    []string
+	Token      string
+	LoginProxy string
 }
 
 type ProxyConfig struct {
@@ -418,14 +419,17 @@ func isBadGateway(statusCode int, body string) bool {
 func processLogin(account *Account) error {
 	maxRetries := 10
 	userAgent := browser.Chrome()
-	proxy := account.Proxies[0] //use first proxy
+
+	logger.Info("Using dedicated proxy for login process",
+		zap.String("email", account.Auth.Email),
+		zap.String("proxy", account.LoginProxy))
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		puzzleID, solution, err := solvePuzzle(account.Auth.Email, proxy, userAgent)
+		puzzleID, solution, err := solvePuzzle(account.Auth.Email, account.LoginProxy, userAgent)
 		if err != nil {
 			logger.Error("Failed to solve puzzle",
 				zap.String("email", account.Auth.Email),
-				zap.String("proxy", proxy),
+				zap.String("proxy", account.LoginProxy),
 				zap.Int("attempt", attempt+1),
 				zap.Error(err))
 
@@ -442,7 +446,7 @@ func processLogin(account *Account) error {
 			puzzleID,
 			solution,
 			userAgent,
-			proxy,
+			account.LoginProxy,
 		)
 
 		if err != nil {
@@ -453,7 +457,7 @@ func processLogin(account *Account) error {
 			if strings.Contains(err.Error(), "502 Bad Gateway") {
 				logger.Warn("Received 502 Bad Gateway",
 					zap.String("email", account.Auth.Email),
-					zap.String("proxy", proxy),
+					zap.String("proxy", account.LoginProxy),
 					zap.Int("attempt", attempt+1))
 
 				if attempt < maxRetries-1 {
@@ -466,7 +470,6 @@ func processLogin(account *Account) error {
 			} else if strings.Contains(err.Error(), "Incorrect answer") {
 				logger.Warn("Incorrect puzzle answer",
 					zap.String("email", account.Auth.Email),
-					zap.String("proxy", proxy),
 					zap.Int("attempt", attempt+1),
 					zap.String("solution", solution))
 
@@ -482,7 +485,7 @@ func processLogin(account *Account) error {
 		account.Token = token
 		logger.Info("Login completed",
 			zap.String("email", account.Auth.Email),
-			zap.String("proxy", proxy),
+			zap.String("proxy", account.LoginProxy),
 			zap.Int("attemptsTaken", attempt+1))
 
 		return nil
@@ -673,7 +676,7 @@ func ping(account Account, userAgent string) {
 				logger.Warn("Session expired, attempting to relogin",
 					zap.String("acc", account.Auth.Email))
 
-				// attempt relogin
+				//attempt relogin
 				for retry := 0; retry < maxRetries; retry++ {
 					err := processLogin(&account)
 					if err != nil {
@@ -923,6 +926,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 }
 
 func main() {
+	// init logger
 	config := zap.NewDevelopmentEncoderConfig()
 	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	logger = zap.New(zapcore.NewCore(
@@ -931,7 +935,7 @@ func main() {
 		zapcore.DebugLevel,
 	))
 
-	// load .env file
+	//load .env file
 	if err := godotenv.Load(); err != nil {
 		logger.Fatal("Error loading .env file", zap.Error(err))
 	}
@@ -946,7 +950,7 @@ func main() {
 		logger.Fatal("TWOCAPTCHA_KEY not found in .env")
 	}
 
-	// read login.txt
+	// read cred on login.txt
 	userIDs, auths, err := parseLoginFile("login.txt")
 	if err != nil {
 		logger.Fatal("Error parsing login file", zap.Error(err))
@@ -967,12 +971,13 @@ func main() {
 	// get proxy distribution
 	proxyDistribution := distributor.DistributeProxies()
 
-	// create accounts with distributed proxies
+	// accounts with distributed proxies
 	var accounts []Account
 	for i, auth := range auths {
 		accounts = append(accounts, Account{
-			Auth:    auth,
-			Proxies: proxyDistribution[userIDs[i]],
+			Auth:       auth,
+			Proxies:    proxyDistribution[userIDs[i]], // use all proxies for ping
+			LoginProxy: proxies[i],                    // dedicated proxy for login
 		})
 	}
 
@@ -980,13 +985,14 @@ func main() {
 		zap.Int("totalAccounts", len(accounts)),
 		zap.Int("totalProxies", len(proxies)))
 
+	// start login for each account
 	var successfulLogins int
 	var skippedAccounts int
+
 	for i := range accounts {
 		logger.Info("Processing account...",
 			zap.String("email", accounts[i].Auth.Email),
-			zap.Int("current", i+1),
-			zap.Int("total", len(accounts)))
+			zap.String("loginProxy", accounts[i].LoginProxy))
 
 		err := processLogin(&accounts[i])
 		if err != nil {
@@ -994,7 +1000,7 @@ func main() {
 				logger.Error("Skipping account due to invalid credentials",
 					zap.String("email", accounts[i].Auth.Email))
 				skippedAccounts++
-				continue // skip to next acc
+				continue
 			}
 
 			logger.Error("Failed to process login",
@@ -1010,7 +1016,6 @@ func main() {
 			zap.Int("totalAccounts", len(accounts)))
 	}
 
-	// log final summary
 	logger.Info("Login process completed",
 		zap.Int("totalAccounts", len(accounts)),
 		zap.Int("successfulLogins", successfulLogins),
@@ -1020,19 +1025,19 @@ func main() {
 		logger.Fatal("No accounts were successfully logged in")
 	}
 
-	// init telegram bot
+	// init tele bot
 	b, err := bot.New(botToken)
 	if err != nil {
 		logger.Fatal("Error creating bot", zap.Error(err))
 	}
 
-	// regist telegram handlers
+	// telegram handlers
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, handleStart)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/point", bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
 		handlePoint(ctx, b, update, accounts)
 	})
 
-	// start ping routines only for accounts with valid tokens
+	// start ping with goroutines
 	logger.Info("Starting ping routines",
 		zap.Int("successfulLogins", successfulLogins))
 
@@ -1041,13 +1046,14 @@ func main() {
 			go func(acc Account) {
 				userAgent := browser.Chrome()
 				logger.Info("Starting ping routine",
-					zap.String("email", acc.Auth.Email))
+					zap.String("email", acc.Auth.Email),
+					zap.Int("proxyCount", len(acc.Proxies)))
 				ping(acc, userAgent)
 			}(account)
 		}
 	}
 
-	// start tele bot
+	// start telegram bot
 	logger.Info("Starting Telegram bot")
 	b.Start(context.Background())
 }
