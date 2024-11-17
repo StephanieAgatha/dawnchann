@@ -940,9 +940,13 @@ func main() {
 		logger.Fatal("Error loading .env file", zap.Error(err))
 	}
 
+	// check telegram config
 	botToken := os.Getenv("BOT_TOKEN")
-	if botToken == "" {
-		logger.Fatal("BOT_TOKEN not found in .env")
+	chatID := os.Getenv("CHAT_ID")
+	telegramEnabled := botToken != "" && chatID != ""
+
+	if !telegramEnabled {
+		logger.Info("Telegram bot disabled: bot token or chat not set in .env file")
 	}
 
 	twoCaptchaKey := os.Getenv("TWOCAPTCHA_KEY")
@@ -980,10 +984,6 @@ func main() {
 			LoginProxy: proxies[i],                    // dedicated proxy for login
 		})
 	}
-
-	logger.Info("Initial setup complete",
-		zap.Int("totalAccounts", len(accounts)),
-		zap.Int("totalProxies", len(proxies)))
 
 	// start login for each account
 	var successfulLogins int
@@ -1025,18 +1025,6 @@ func main() {
 		logger.Fatal("No accounts were successfully logged in")
 	}
 
-	// init tele bot
-	b, err := bot.New(botToken)
-	if err != nil {
-		logger.Fatal("Error creating bot", zap.Error(err))
-	}
-
-	// telegram handlers
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, handleStart)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "/point", bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
-		handlePoint(ctx, b, update, accounts)
-	})
-
 	// start ping with goroutines
 	logger.Info("Starting ping routines",
 		zap.Int("successfulLogins", successfulLogins))
@@ -1053,7 +1041,24 @@ func main() {
 		}
 	}
 
-	// start telegram bot
-	logger.Info("Starting Telegram bot")
-	b.Start(context.Background())
+	// init telegram bot only if enabled
+	if telegramEnabled {
+		logger.Info("Initializing Telegram bot...")
+		b, err := bot.New(botToken)
+		if err != nil {
+			logger.Error("Error creating Telegram bot, continuing without bot", zap.Error(err))
+		} else {
+			// telegram handlers
+			b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, handleStart)
+			b.RegisterHandler(bot.HandlerTypeMessageText, "/point", bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
+				handlePoint(ctx, b, update, accounts)
+			})
+
+			logger.Info("Starting Telegram bot")
+			b.Start(context.Background())
+		}
+	}
+
+	// if telegram is disabled or failed to start, keep the program running
+	select {}
 }
