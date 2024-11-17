@@ -209,12 +209,13 @@ func readProxies(path string) ([]string, error) {
 }
 
 // get puzzle
-func getPuzzleID(userAgent string) (string, error) {
+func getPuzzleID(userAgent string, proxy string) (string, error) {
 	client := resty.New().
 		SetTimeout(30 * time.Second).
 		SetRetryCount(3).
 		SetRetryWaitTime(5 * time.Second).
 		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetProxy(proxy).
 		SetHeaders(map[string]string{
 			"accept":          "*/*",
 			"accept-language": "en-US,en;q=0.9",
@@ -245,12 +246,13 @@ func getPuzzleID(userAgent string) (string, error) {
 	return puzzleResp.PuzzleID, nil
 }
 
-func getPuzzleImage(puzzleID, userAgent string) (string, error) {
+func getPuzzleImage(puzzleID, userAgent string, proxy string) (string, error) {
 	client := resty.New().
 		SetTimeout(30 * time.Second).
 		SetRetryCount(3).
 		SetRetryWaitTime(5 * time.Second).
 		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetProxy(proxy).
 		SetHeaders(map[string]string{
 			"accept":          "*/*",
 			"accept-language": "en-US,en;q=0.9",
@@ -282,15 +284,13 @@ func getPuzzleImage(puzzleID, userAgent string) (string, error) {
 }
 
 // solve puzzle
-func solvePuzzle(email string) (string, string, error) {
-	userAgent := browser.MacOSX()
-
-	puzzleID, err := getPuzzleID(userAgent)
+func solvePuzzle(email string, proxy string, userAgent string) (string, string, error) {
+	puzzleID, err := getPuzzleID(userAgent, proxy)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get puzzle: %v", err)
 	}
 
-	imgBase64, err := getPuzzleImage(puzzleID, userAgent)
+	imgBase64, err := getPuzzleImage(puzzleID, userAgent, proxy)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get puzzle image: %v", err)
 	}
@@ -417,12 +417,15 @@ func isBadGateway(statusCode int, body string) bool {
 
 func processLogin(account *Account) error {
 	maxRetries := 10
+	userAgent := browser.Chrome()
+	proxy := account.Proxies[0] //use first proxy
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		puzzleID, solution, err := solvePuzzle(account.Auth.Email)
+		puzzleID, solution, err := solvePuzzle(account.Auth.Email, proxy, userAgent)
 		if err != nil {
 			logger.Error("Failed to solve puzzle",
 				zap.String("email", account.Auth.Email),
+				zap.String("proxy", proxy),
 				zap.Int("attempt", attempt+1),
 				zap.Error(err))
 
@@ -438,7 +441,8 @@ func processLogin(account *Account) error {
 			account.Auth.Password,
 			puzzleID,
 			solution,
-			browser.Chrome(),
+			userAgent,
+			proxy,
 		)
 
 		if err != nil {
@@ -449,6 +453,7 @@ func processLogin(account *Account) error {
 			if strings.Contains(err.Error(), "502 Bad Gateway") {
 				logger.Warn("Received 502 Bad Gateway",
 					zap.String("email", account.Auth.Email),
+					zap.String("proxy", proxy),
 					zap.Int("attempt", attempt+1))
 
 				if attempt < maxRetries-1 {
@@ -461,6 +466,7 @@ func processLogin(account *Account) error {
 			} else if strings.Contains(err.Error(), "Incorrect answer") {
 				logger.Warn("Incorrect puzzle answer",
 					zap.String("email", account.Auth.Email),
+					zap.String("proxy", proxy),
 					zap.Int("attempt", attempt+1),
 					zap.String("solution", solution))
 
@@ -476,6 +482,7 @@ func processLogin(account *Account) error {
 		account.Token = token
 		logger.Info("Login completed",
 			zap.String("email", account.Auth.Email),
+			zap.String("proxy", proxy),
 			zap.Int("attemptsTaken", attempt+1))
 
 		return nil
@@ -484,7 +491,7 @@ func processLogin(account *Account) error {
 	return fmt.Errorf("exceeded maximum retry attempts (%d)", maxRetries)
 }
 
-func loginDawn(email, password, puzzleID, captchaSolution, userAgent string) (string, error) {
+func loginDawn(email, password, puzzleID, captchaSolution, userAgent, proxy string) (string, error) {
 	loginPayload := request.LoginRequest{
 		Username: email,
 		Password: password,
@@ -501,6 +508,7 @@ func loginDawn(email, password, puzzleID, captchaSolution, userAgent string) (st
 		SetRetryCount(3).
 		SetRetryWaitTime(5 * time.Second).
 		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetProxy(proxy).
 		SetHeaders(map[string]string{
 			"accept":          "*/*",
 			"accept-language": "en-US,en;q=0.9",
