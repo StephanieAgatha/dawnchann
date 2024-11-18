@@ -826,57 +826,108 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 	messageLines = append(messageLines, fmt.Sprintf("📊 Total Accounts: %d\n", totalUsers))
 
 	for i, account := range accounts {
-		// Use masked email in the output
 		linePrefix := fmt.Sprintf("%d. %s", i+1, maskEmail(account.Auth.Email))
 
-		client := resty.New().
-			SetTimeout(30 * time.Second).
-			SetRetryCount(3).
-			SetRetryWaitTime(5 * time.Second).
-			SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
-			SetHeaders(map[string]string{
-				"content-type":    "application/json",
-				"origin":          "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-				"accept":          "*/*",
-				"accept-language": "en-US,en;q=0.9",
-				"priority":        "u=1, i",
-				"sec-fetch-dest":  "empty",
-				"sec-fetch-mode":  "cors",
-				"sec-fetch-site":  "cross-site",
-				"user-agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.80 Safari/537.36",
-			})
+		var points float64
+		var pointsErr error
+		maxAttempts := 3
 
-		client.SetProxy(account.Proxies[0])
+		for attempt := 0; attempt < maxAttempts; attempt++ {
+			proxy := account.Proxies[attempt%len(account.Proxies)] // rotate proxies for retries
+			userAgent := browser.Chrome()
 
-		res, err := client.R().
-			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Auth.Password)).
-			Get(constant.GetPointURL)
+			client := resty.New().
+				SetTimeout(30 * time.Second).
+				SetRetryCount(3).
+				SetRetryWaitTime(5 * time.Second).
+				SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+				SetProxy(proxy).
+				SetHeaders(map[string]string{
+					"content-type":    "application/json",
+					"origin":          "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
+					"accept":          "*/*",
+					"accept-language": "en-US,en;q=0.9",
+					"priority":        "u=1, i",
+					"sec-fetch-dest":  "empty",
+					"sec-fetch-mode":  "cors",
+					"sec-fetch-site":  "cross-site",
+					"user-agent":      userAgent,
+				})
 
-		if err != nil {
-			logger.Error("Failed to fetch points",
-				zap.String("account", maskEmail(account.Auth.Email)),
-				zap.Error(err))
+			res, err := client.R().
+				SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)). // use token instead pw
+				Get(constant.GetPointURL)
 
-			messageLines = append(messageLines, fmt.Sprintf("%s\n❌ Error: Connection failed\n",
-				linePrefix))
-			continue
+			if err != nil {
+				logger.Error("Failed to fetch points",
+					zap.String("account", maskEmail(account.Auth.Email)),
+					zap.Int("attempt", attempt+1),
+					zap.Error(err))
+
+				if attempt < maxAttempts-1 {
+					time.Sleep(2 * time.Second)
+					continue
+				}
+
+				messageLines = append(messageLines, fmt.Sprintf("%s\n❌ Error: Connection failed\n",
+					linePrefix))
+				break
+			}
+
+			response := res.String()
+
+			// check if session expired or ssl error
+			if isSessionExpired(response) || strings.Contains(response, "Provider routines") {
+				logger.Warn("Session issue detected, attempting relogin",
+					zap.String("account", maskEmail(account.Auth.Email)),
+					zap.Int("attempt", attempt+1))
+
+				if err := processLogin(&account); err != nil {
+					logger.Error("Relogin failed",
+						zap.String("account", maskEmail(account.Auth.Email)),
+						zap.Error(err))
+					if attempt < maxAttempts-1 {
+						time.Sleep(2 * time.Second)
+						continue
+					}
+					messageLines = append(messageLines, fmt.Sprintf("%s\n❌ Error: Relogin failed\n",
+						linePrefix))
+					break
+				}
+
+				res, err = client.R().
+					SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
+					Get(constant.GetPointURL)
+
+				if err != nil {
+					continue
+				}
+				response = res.String()
+			}
+
+			points, pointsErr = calculateTotalPoints(response)
+			if pointsErr == nil {
+				break // success, exit retry loop
+			}
+
+			if attempt < maxAttempts-1 {
+				time.Sleep(2 * time.Second)
+				continue
+			}
 		}
 
-		points, err := calculateTotalPoints(res.String())
-		if err != nil {
-			logger.Error("Failed to calculate points",
+		if pointsErr != nil {
+			logger.Error("Failed to calculate points after all attempts",
 				zap.String("account", maskEmail(account.Auth.Email)),
-				zap.String("response", cleanResponse(res.String())),
-				zap.Error(err))
-
-			messageLines = append(messageLines, fmt.Sprintf("%s\n❌ Error: Invalid response\n", linePrefix))
+				zap.Error(pointsErr))
+			messageLines = append(messageLines, fmt.Sprintf("%s\n❌ Error: Points calculation failed\n",
+				linePrefix))
 			continue
 		}
 
 		successCount++
 		totalPoints += points
-
-		messageLines = append(messageLines, fmt.Sprintf("%s\n Points: %s\n",
+		messageLines = append(messageLines, fmt.Sprintf("%s\n✅ Points: %s\n",
 			linePrefix,
 			formatReadablePoints(points)))
 	}
