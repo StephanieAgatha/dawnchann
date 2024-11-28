@@ -60,15 +60,14 @@ Create the following files in your project directory:
    🔍 Dawn Points Checker Report
    📊 Total Accounts: 2
 
-1. us****1@example.com
+     us****1@example.com
    ✅ Points: 1,234.56
-
-2. us****2@example.com
+   
+    us****2@example.com
    ✅ Points: 5,678.90
+   📈 Summary:
+   • Success Rate: 2/2 (100.0%)
+   • Average Points: 3,456.73
+   • Total Points: 6,913.46
 
-📈 Summary:
-• Success Rate: 2/2 (100.0%)
-• Average Points: 3,456.73
-• Total Points: 6,913.46
-
-🕒 2024-11-28 10:30:00 WIB
+   🕒 2024-11-28 10:30:00 WIB
