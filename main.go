@@ -599,8 +599,43 @@ func isInvalidCredentials(err error) bool {
 	return strings.Contains(err.Error(), "Invalid username or Password")
 }
 
+func isErrorResponse(response string) bool {
+	errorIndicators := []string{
+		"<!DOCTYPE html>",
+		"<html",
+		"502",
+		"Bad gateway",
+		"Bad Gateway",
+		"cloudflare",
+		"error-details",
+		"cf-error-details",
+	}
+
+	for _, indicator := range errorIndicators {
+		if strings.Contains(response, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
 func cleanResponse(response string) string {
-	if strings.Contains(response, "502 Bad Gateway") {
+	if response == "" {
+		return ""
+	}
+
+	var jsonResponse struct {
+		Success bool   `json:"success"`
+		Message string `json:"message"`
+	}
+
+	if err := json.Unmarshal([]byte(response), &jsonResponse); err == nil {
+		if !jsonResponse.Success {
+			return ""
+		}
+		return response
+	}
+	if isErrorResponse(response) {
 		return ""
 	}
 	return response
