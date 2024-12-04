@@ -12,6 +12,7 @@ import (
 	"github.com/joho/godotenv"
 	"log"
 	"math"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ type Account struct {
 	Proxies    []string
 	Token      string
 	LoginProxy string
+	AppID      string
 }
 
 type ProxyConfig struct {
@@ -209,8 +211,21 @@ func readProxies(path string) ([]string, error) {
 	return proxies, scanner.Err()
 }
 
+// gen app id
+func generateappID() string {
+	const charset = "abcdef0123456789"
+	const length = 24
+	result := make([]byte, length)
+	for i := range result {
+		result[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(result)
+}
+
 // get puzzle
-func getPuzzleID(userAgent string, proxy string) (string, error) {
+func getPuzzleID(userAgent string, proxy string) (string, string, error) {
+	appID := generateappID()
+
 	client := resty.New().
 		SetTimeout(30 * time.Second).
 		SetRetryCount(3).
@@ -224,30 +239,30 @@ func getPuzzleID(userAgent string, proxy string) (string, error) {
 		})
 
 	resp, err := client.R().
-		Get("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle?appid=undefined")
+		Get("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle?appid=" + appID)
 
 	if err != nil {
-		return "", fmt.Errorf("failed to get puzzle: %v", err)
+		return "", "", fmt.Errorf("failed to get puzzle: %v", err)
 	}
 
 	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+		return "", "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
 	}
 
 	var puzzleResp request.PuzzleResponse
 	if err := json.Unmarshal(resp.Body(), &puzzleResp); err != nil {
-		return "", fmt.Errorf("failed to parse puzzle response: %v", err)
+		return "", "", fmt.Errorf("failed to parse puzzle response: %v", err)
 	}
 
 	if !puzzleResp.Success {
-		return "", fmt.Errorf("puzzle request unsuccessful")
+		return "", "", fmt.Errorf("puzzle request unsuccessful")
 	}
 
 	logger.Info("Puzzle ID obtained", zap.String("id", puzzleResp.PuzzleID))
-	return puzzleResp.PuzzleID, nil
+	return puzzleResp.PuzzleID, appID, nil
 }
 
-func getPuzzleImage(puzzleID, userAgent string, proxy string) (string, error) {
+func getPuzzleImage(puzzleID, appID, userAgent string, proxy string) (string, error) {
 	client := resty.New().
 		SetTimeout(30 * time.Second).
 		SetRetryCount(3).
@@ -260,7 +275,7 @@ func getPuzzleImage(puzzleID, userAgent string, proxy string) (string, error) {
 			"user-agent":      userAgent,
 		})
 
-	url := fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle-image?puzzle_id=%s&appid=undefined", puzzleID)
+	url := fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle-image?puzzle_id=%s&appid=%s", puzzleID, appID)
 	resp, err := client.R().Get(url)
 
 	if err != nil {
@@ -285,33 +300,33 @@ func getPuzzleImage(puzzleID, userAgent string, proxy string) (string, error) {
 }
 
 // solve puzzle
-func solvePuzzle(email string, proxy string, userAgent string) (string, string, error) {
-	puzzleID, err := getPuzzleID(userAgent, proxy)
+func solvePuzzle(email string, proxy string, userAgent string) (string, string, string, error) {
+	puzzleID, appID, err := getPuzzleID(userAgent, proxy)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get puzzle: %v", err)
+		return "", "", "", fmt.Errorf("failed to get puzzle: %v", err)
 	}
 
-	imgBase64, err := getPuzzleImage(puzzleID, userAgent, proxy)
+	imgBase64, err := getPuzzleImage(puzzleID, appID, userAgent, proxy)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get puzzle image: %v", err)
+		return "", "", "", fmt.Errorf("failed to get puzzle image: %v", err)
 	}
 
 	twoCaptchaKey := os.Getenv("TWOCAPTCHA_KEY")
 	taskID, err := createCaptchaTask(twoCaptchaKey, imgBase64)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create captcha task: %v", err)
+		return "", "", "", fmt.Errorf("failed to create captcha task: %v", err)
 	}
 
 	solution, err := getCaptchaResult(twoCaptchaKey, taskID)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get captcha result: %v", err)
+		return "", "", "", fmt.Errorf("failed to get captcha result: %v", err)
 	}
 
 	logger.Info("Puzzle solved successfully",
 		zap.String("account", email),
 		zap.String("solution", solution))
 
-	return puzzleID, solution, nil
+	return puzzleID, solution, appID, nil
 }
 
 // captcha logic
@@ -425,7 +440,7 @@ func processLogin(account *Account) error {
 		zap.String("proxy", account.LoginProxy))
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		puzzleID, solution, err := solvePuzzle(account.Auth.Email, account.LoginProxy, userAgent)
+		puzzleID, solution, appID, err := solvePuzzle(account.Auth.Email, account.LoginProxy, userAgent)
 		if err != nil {
 			logger.Error("Failed to solve puzzle",
 				zap.String("email", account.Auth.Email),
@@ -445,6 +460,7 @@ func processLogin(account *Account) error {
 			account.Auth.Password,
 			puzzleID,
 			solution,
+			appID,
 			userAgent,
 			account.LoginProxy,
 		)
@@ -494,7 +510,7 @@ func processLogin(account *Account) error {
 	return fmt.Errorf("exceeded maximum retry attempts (%d)", maxRetries)
 }
 
-func loginDawn(email, password, puzzleID, captchaSolution, userAgent, proxy string) (string, error) {
+func loginDawn(email, password, puzzleID, captchaSolution, appID, userAgent, proxy string) (string, error) {
 	loginPayload := request.LoginRequest{
 		Username: email,
 		Password: password,
@@ -521,13 +537,12 @@ func loginDawn(email, password, puzzleID, captchaSolution, userAgent, proxy stri
 
 	resp, err := client.R().
 		SetBody(loginPayload).
-		Post("https://www.aeropres.in/chromeapi/dawn/v1/user/login/v2?appid=undefined")
+		Post("https://www.aeropres.in/chromeapi/dawn/v1/user/login/v2?appid=" + appID)
 
 	if err != nil {
 		return "", fmt.Errorf("login request failed: %v", err)
 	}
 
-	// 502 err case
 	if isBadGateway(resp.StatusCode(), resp.String()) {
 		return "", fmt.Errorf("502 Bad Gateway received")
 	}
@@ -669,9 +684,35 @@ func humanizeFloat(f float64) string {
 	return fmt.Sprintf("%s.%03d", intStr, int(fracPart*1000))
 }
 
+// get points
+func getPoints(client *resty.Client, account Account, appID string) (float64, error) {
+	res, err := client.R().
+		SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
+		Get("https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid=" + appID)
+
+	if err != nil {
+		return 0, err
+	}
+
+	response := res.String()
+	if isSessionExpired(response) {
+		return 0, &SessionExpiredError{Message: "Session expired during points check"}
+	}
+
+	points, err := calculateTotalPoints(response)
+	if err != nil {
+		return 0, fmt.Errorf("failed to calculate points: %v", err)
+	}
+
+	return points, nil
+}
+
+// ping
 func ping(account Account, userAgent string) {
 	currentProxyIndex := 0
 	maxRetries := 5
+	// Use the existing appID from Account struct
+	appID := account.AppID
 
 	for {
 		proxy := account.Proxies[currentProxyIndex]
@@ -699,7 +740,7 @@ func ping(account Account, userAgent string) {
 		res, err := client.R().
 			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
 			SetBody(keepAliveRequest).
-			Post(constant.KeepAliveURL)
+			Post("https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive?appid=" + appID)
 
 		if err != nil {
 			logger.Error("Keep alive error",
@@ -708,10 +749,9 @@ func ping(account Account, userAgent string) {
 		} else {
 			response := res.String()
 			if isSessionExpired(response) {
-				logger.Warn("Session expired, attempting to relogin",
+				logger.Warn("Session expired, attempting relogin",
 					zap.String("acc", account.Auth.Email))
 
-				//attempt relogin
 				for retry := 0; retry < maxRetries; retry++ {
 					err := processLogin(&account)
 					if err != nil {
@@ -741,22 +781,12 @@ func ping(account Account, userAgent string) {
 				zap.String("res", cleanResponse(response)))
 		}
 
-		// get points
-		res, err = client.R().
-			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
-			Get(constant.GetPointURL)
-
+		points, err := getPoints(client, account, appID)
 		if err != nil {
-			logger.Error("Get point error",
-				zap.String("acc", account.Auth.Email),
-				zap.Error(err))
-		} else {
-			response := res.String()
-			if isSessionExpired(response) {
+			if _, ok := err.(*SessionExpiredError); ok {
 				logger.Warn("Session expired during points check, attempting to relogin",
 					zap.String("acc", account.Auth.Email))
 
-				// attempt relogin
 				for retry := 0; retry < maxRetries; retry++ {
 					err := processLogin(&account)
 					if err != nil {
@@ -781,16 +811,13 @@ func ping(account Account, userAgent string) {
 				continue
 			}
 
-			points, err := calculateTotalPoints(response)
-			if err != nil {
-				logger.Error("Error calculating points",
-					zap.String("acc", account.Auth.Email),
-					zap.Error(err))
-			} else {
-				logger.Info("Points calculated",
-					zap.String("acc", account.Auth.Email),
-					zap.String("points", formatReadablePoints(points)))
-			}
+			logger.Error("Error calculating points",
+				zap.String("acc", account.Auth.Email),
+				zap.Error(err))
+		} else {
+			logger.Info("Points calculated",
+				zap.String("acc", account.Auth.Email),
+				zap.String("points", formatReadablePoints(points)))
 		}
 
 		time.Sleep(1 * time.Minute)
@@ -868,7 +895,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 		maxAttempts := 3
 
 		for attempt := 0; attempt < maxAttempts; attempt++ {
-			proxy := account.Proxies[attempt%len(account.Proxies)] // rotate proxies for retries
+			proxy := account.Proxies[attempt%len(account.Proxies)]
 			userAgent := browser.Chrome()
 
 			client := resty.New().
@@ -890,8 +917,8 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 				})
 
 			res, err := client.R().
-				SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)). // use token instead pw
-				Get(constant.GetPointURL)
+				SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
+				Get("https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid=" + generateappID())
 
 			if err != nil {
 				logger.Error("Failed to fetch points",
@@ -911,7 +938,6 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 
 			response := res.String()
 
-			// check if session expired or ssl error
 			if isSessionExpired(response) || strings.Contains(response, "Provider routines") {
 				logger.Warn("Session issue detected, attempting relogin",
 					zap.String("account", maskEmail(account.Auth.Email)),
@@ -932,7 +958,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 
 				res, err = client.R().
 					SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
-					Get(constant.GetPointURL)
+					Get("https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid=" + generateappID())
 
 				if err != nil {
 					continue
@@ -942,7 +968,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 
 			points, pointsErr = calculateTotalPoints(response)
 			if pointsErr == nil {
-				break // success, exit retry loop
+				break
 			}
 
 			if attempt < maxAttempts-1 {
