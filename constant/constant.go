@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	MaxRetries    = 10
+	MaxRetries    = 50
 	RetryInterval = 5 * time.Second
 	TwoCaptchaURL = "https://api.2captcha.com"
 )
