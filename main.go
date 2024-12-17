@@ -432,7 +432,7 @@ func isBadGateway(statusCode int, body string) bool {
 }
 
 func processLogin(account *Account) error {
-	maxRetries := 10
+	maxRetries := 50
 	userAgent := browser.Chrome()
 
 	logger.Info("Using dedicated proxy for login process",
