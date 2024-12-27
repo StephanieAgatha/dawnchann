@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -825,6 +826,20 @@ func ping(account Account, userAgent string) {
 }
 
 // telegram logic
+func isAuthorizedChat(chatID int64) bool {
+	allowedChatID := os.Getenv("CHAT_ID")
+	if allowedChatID == "" {
+		return false
+	}
+	authorizedID, err := strconv.ParseInt(allowedChatID, 10, 64)
+	if err != nil {
+		logger.Error("Failed to parse CHAT_ID", zap.Error(err))
+		return false
+	}
+
+	return chatID == authorizedID
+}
+
 func logUserInteraction(update *models.Update, action string) {
 	username := update.Message.From.Username
 	if username == "" {
@@ -834,7 +849,22 @@ func logUserInteraction(update *models.Update, action string) {
 }
 
 func handleStart(ctx context.Context, b *bot.Bot, update *models.Update) {
-	logUserInteraction(update, "started the bot")
+	logUserInteraction(update, "attempted to start the bot")
+
+	if !isAuthorizedChat(update.Message.Chat.ID) {
+		logger.Warn("Unauthorized access attempt",
+			zap.Int64("chatID", update.Message.Chat.ID),
+			zap.String("username", update.Message.From.Username))
+
+		if _, err := b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   "⛔ Unauthorized. You don't have permission to use this bot.",
+		}); err != nil {
+			log.Printf("Error sending unauthorized message: %v", err)
+		}
+		return
+	}
+
 	if _, err := b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: update.Message.Chat.ID,
 		Text:   "Welcome, please send the /point command to check your points",
@@ -844,6 +874,20 @@ func handleStart(ctx context.Context, b *bot.Bot, update *models.Update) {
 }
 
 func handlePoint(ctx context.Context, b *bot.Bot, update *models.Update, accounts []Account) {
+	if !isAuthorizedChat(update.Message.Chat.ID) {
+		logger.Warn("Unauthorized points request attempt",
+			zap.Int64("chatID", update.Message.Chat.ID),
+			zap.String("username", update.Message.From.Username))
+
+		if _, err := b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: update.Message.Chat.ID,
+			Text:   "⛔ Unauthorized. You don't have permission to use this bot.",
+		}); err != nil {
+			log.Printf("Error sending unauthorized message: %v", err)
+		}
+		return
+	}
+
 	logUserInteraction(update, "requested point information")
 	sendTelegramNotification(ctx, b, update.Message.Chat.ID, accounts)
 }
