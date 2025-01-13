@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"dawnchann/constant"
 	"dawnchann/request"
 	"encoding/json"
+	"errors"
 	"fmt"
 	browser "github.com/itzngga/fake-useragent"
 	"github.com/joho/godotenv"
+	"io"
 	"log"
 	"math"
 	"math/rand"
@@ -19,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/go-resty/resty/v2"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -28,6 +33,11 @@ import (
 )
 
 var logger *zap.Logger
+
+var (
+	extensionID = "fpdkjdnhkakefebpekbdhillbhonfjjp"
+	chromeUA    = browser.Chrome()
+)
 
 type Account struct {
 	Auth       request.Authentication
@@ -212,6 +222,20 @@ func readProxies(path string) ([]string, error) {
 	return proxies, scanner.Err()
 }
 
+func getHeaders(extensionID string) map[string]string {
+	return map[string]string{
+		"Accept":          "*/*",
+		"Accept-Encoding": "gzip, deflate, br, zstd",
+		"Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+		"User-Agent":      chromeUA,
+		"Sec-Fetch-Dest":  "empty",
+		"Sec-Fetch-Mode":  "cors",
+		"Sec-Fetch-Site":  "cross-site",
+		"Content-Type":    "application/json",
+		"Origin":          fmt.Sprintf("chrome-extension://%s", extensionID),
+	}
+}
+
 // gen app id
 func generateappID() string {
 	const charset = "abcdef0123456789"
@@ -224,22 +248,21 @@ func generateappID() string {
 }
 
 // get puzzle
-func getPuzzleID(userAgent string, proxy string) (string, string, error) {
+func getPuzzleID(proxy string) (string, string, error) {
 	appID := generateappID()
+	logger.Info("app id generated", zap.String("appid", appID))
 
 	client := resty.New().
 		SetTimeout(30 * time.Second).
 		SetRetryCount(3).
 		SetRetryWaitTime(5 * time.Second).
 		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
-		SetProxy(proxy).
-		SetHeaders(map[string]string{
-			"accept":          "*/*",
-			"accept-language": "en-US,en;q=0.9",
-			"user-agent":      userAgent,
-		})
+		SetProxy(proxy)
+
+	headers := getHeaders(extensionID)
 
 	resp, err := client.R().
+		SetHeaders(headers).
 		Get("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle?appid=" + appID)
 
 	if err != nil {
@@ -259,7 +282,7 @@ func getPuzzleID(userAgent string, proxy string) (string, string, error) {
 		return "", "", fmt.Errorf("puzzle request unsuccessful")
 	}
 
-	logger.Info("Puzzle ID obtained", zap.String("id", puzzleResp.PuzzleID))
+	logger.Info("puzzle id obtained", zap.String("puzzleid", puzzleResp.PuzzleID))
 	return puzzleResp.PuzzleID, appID, nil
 }
 
@@ -301,17 +324,22 @@ func getPuzzleImage(puzzleID, appID, userAgent string, proxy string) (string, er
 }
 
 // solve puzzle
-func solvePuzzle(email string, proxy string, userAgent string) (string, string, string, error) {
-	puzzleID, appID, err := getPuzzleID(userAgent, proxy)
+func solvePuzzle(email string, proxy string) (string, string, string, error) {
+	userAgent := browser.Chrome()
+
+	// get puzzle id
+	puzzleID, appID, err := getPuzzleID(proxy)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get puzzle: %v", err)
 	}
 
+	// get puzzle image
 	imgBase64, err := getPuzzleImage(puzzleID, appID, userAgent, proxy)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to get puzzle image: %v", err)
 	}
 
+	//captcha task
 	twoCaptchaKey := os.Getenv("TWOCAPTCHA_KEY")
 	taskID, err := createCaptchaTask(twoCaptchaKey, imgBase64)
 	if err != nil {
@@ -428,20 +456,15 @@ func getCaptchaResult(apiKey string, taskID int64) (string, error) {
 }
 
 // login
-func isBadGateway(statusCode int, body string) bool {
-	return statusCode == 502 || strings.Contains(body, "502 Bad Gateway")
-}
-
 func processLogin(account *Account) error {
 	maxRetries := 50
-	userAgent := browser.Chrome()
 
 	logger.Info("Using dedicated proxy for login process",
 		zap.String("email", account.Auth.Email),
 		zap.String("proxy", account.LoginProxy))
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		puzzleID, solution, appID, err := solvePuzzle(account.Auth.Email, account.LoginProxy, userAgent)
+		puzzleID, solution, appID, err := solvePuzzle(account.Auth.Email, account.LoginProxy)
 		if err != nil {
 			logger.Error("Failed to solve puzzle",
 				zap.String("email", account.Auth.Email),
@@ -455,6 +478,7 @@ func processLogin(account *Account) error {
 			}
 			return fmt.Errorf("failed to solve puzzle after %d attempts: %v", maxRetries, err)
 		}
+		account.AppID = appID
 
 		token, err := loginDawn(
 			account.Auth.Email,
@@ -462,7 +486,6 @@ func processLogin(account *Account) error {
 			puzzleID,
 			solution,
 			appID,
-			userAgent,
 			account.LoginProxy,
 		)
 
@@ -511,30 +534,37 @@ func processLogin(account *Account) error {
 	return fmt.Errorf("exceeded maximum retry attempts (%d)", maxRetries)
 }
 
-func loginDawn(email, password, puzzleID, captchaSolution, appID, userAgent, proxy string) (string, error) {
+func loginDawn(email, password, puzzleID, captchaSolution, appID, proxy string) (string, error) {
 	loginPayload := request.LoginRequest{
 		Username: email,
 		Password: password,
 		LoginData: request.LoginData{
-			Version:  "1.0.9",
+			Version:  "1.1.2",
 			DateTime: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
 		},
 		PuzzleID: puzzleID,
 		Answer:   captchaSolution,
 	}
 
+	userAgent := browser.Chrome()
+
 	client := resty.New().
-		SetTimeout(30 * time.Second).
+		SetTimeout(2 * time.Minute).
 		SetRetryCount(3).
 		SetRetryWaitTime(5 * time.Second).
-		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
+		SetTLSClientConfig(&tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		}).
 		SetProxy(proxy).
 		SetHeaders(map[string]string{
 			"accept":          "*/*",
 			"accept-language": "en-US,en;q=0.9",
 			"content-type":    "application/json",
+			"origin":          "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
 			"user-agent":      userAgent,
-		})
+		}).
+		SetDoNotParseResponse(true)
 
 	resp, err := client.R().
 		SetBody(loginPayload).
@@ -543,29 +573,45 @@ func loginDawn(email, password, puzzleID, captchaSolution, appID, userAgent, pro
 	if err != nil {
 		return "", fmt.Errorf("login request failed: %v", err)
 	}
+	defer resp.RawBody().Close()
 
-	if isBadGateway(resp.StatusCode(), resp.String()) {
-		return "", fmt.Errorf("502 Bad Gateway received")
+	bodyBytes, err := io.ReadAll(resp.RawBody())
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %v", err)
 	}
 
+	if len(bodyBytes) > 0 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b {
+		reader, err := gzip.NewReader(bytes.NewReader(bodyBytes))
+		if err != nil {
+			return "", fmt.Errorf("failed to create gzip reader: %v", err)
+		}
+		defer reader.Close()
+
+		bodyBytes, err = io.ReadAll(reader)
+		if err != nil {
+			return "", fmt.Errorf("failed to read gzipped content: %v", err)
+		}
+	}
+
+	if strings.Contains(resp.Header().Get("Content-Encoding"), "br") {
+		reader := brotli.NewReader(bytes.NewReader(bodyBytes))
+		decompressed, err := io.ReadAll(reader)
+		if err != nil {
+			return "", fmt.Errorf("failed to decompress brotli content: %v", err)
+		}
+		bodyBytes = decompressed
+	}
+
+	logger.Info("Login raw response", zap.Int("statusCode", resp.StatusCode()))
+
 	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
-		var errorResp struct {
-			Success bool   `json:"success"`
-			Message string `json:"message"`
-			MsgCode int    `json:"msgcode"`
-		}
-
-		if err := json.Unmarshal(resp.Body(), &errorResp); err != nil {
-			return "", fmt.Errorf("login failed with status code: %d, body: %s",
-				resp.StatusCode(), resp.String())
-		}
-
-		return "", fmt.Errorf("%s", errorResp.Message)
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
 	}
 
 	var loginResp request.LoginResponse
-	if err := json.Unmarshal(resp.Body(), &loginResp); err != nil {
-		return "", fmt.Errorf("failed to parse login response: %v", err)
+	if err := json.Unmarshal(bodyBytes, &loginResp); err != nil {
+		return "", fmt.Errorf("failed to parse login response: %v, raw: %s",
+			err, string(bodyBytes))
 	}
 
 	if !loginResp.Status {
@@ -613,48 +659,6 @@ func (e *InvalidCredentialsError) Error() string {
 
 func isInvalidCredentials(err error) bool {
 	return strings.Contains(err.Error(), "Invalid username or Password")
-}
-
-func isErrorResponse(response string) bool {
-	errorIndicators := []string{
-		"<!DOCTYPE html>",
-		"<html",
-		"502",
-		"Bad gateway",
-		"Bad Gateway",
-		"cloudflare",
-		"error-details",
-		"cf-error-details",
-	}
-
-	for _, indicator := range errorIndicators {
-		if strings.Contains(response, indicator) {
-			return true
-		}
-	}
-	return false
-}
-
-func cleanResponse(response string) string {
-	if response == "" {
-		return ""
-	}
-
-	var jsonResponse struct {
-		Success bool   `json:"success"`
-		Message string `json:"message"`
-	}
-
-	if err := json.Unmarshal([]byte(response), &jsonResponse); err == nil {
-		if !jsonResponse.Success {
-			return ""
-		}
-		return response
-	}
-	if isErrorResponse(response) {
-		return ""
-	}
-	return response
 }
 
 func formatReadablePoints(points float64) string {
@@ -712,44 +716,54 @@ func getPoints(client *resty.Client, account Account, appID string) (float64, er
 func ping(account Account, userAgent string) {
 	currentProxyIndex := 0
 	maxRetries := 5
-	// Use the existing appID from Account struct
-	appID := account.AppID
 
 	for {
 		proxy := account.Proxies[currentProxyIndex]
 		currentProxyIndex = (currentProxyIndex + 1) % len(account.Proxies)
 
-		client := resty.New().SetProxy(proxy).
-			SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
-			SetHeader("content-type", "application/json").
-			SetHeader("origin", "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp").
-			SetHeader("accept", "*/*").
-			SetHeader("accept-language", "en-US,en;q=0.9").
-			SetHeader("priority", "u=1, i").
-			SetHeader("sec-fetch-dest", "empty").
-			SetHeader("sec-fetch-mode", "cors").
-			SetHeader("sec-fetch-site", "cross-site").
-			SetHeader("user-agent", userAgent)
+		client := resty.New().
+			SetTimeout(30 * time.Second).
+			SetRetryCount(3).
+			SetRetryWaitTime(5 * time.Second).
+			SetTLSClientConfig(&tls.Config{
+				InsecureSkipVerify: true,
+				MinVersion:         tls.VersionTLS12,
+			}).
+			SetProxy(proxy).
+			SetHeaders(map[string]string{
+				"accept":          "*/*",
+				"accept-language": "en-US,en;q=0.9",
+				"content-type":    "application/json",
+				"origin":          fmt.Sprintf("chrome-extension://%s", extensionID),
+				"user-agent":      userAgent,
+			})
 
 		keepAliveRequest := map[string]interface{}{
 			"username":     account.Auth.Email,
-			"extensionid":  "fpdkjdnhkakefebpekbdhillbhonfjjp",
+			"extensionid":  extensionID,
 			"numberoftabs": 0,
-			"_v":           "1.0.9",
+			"_v":           "1.1.2",
 		}
 
 		res, err := client.R().
 			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
 			SetBody(keepAliveRequest).
-			Post("https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive?appid=" + appID)
+			Post(fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive?appid=%s", account.AppID))
 
 		if err != nil {
 			logger.Error("Keep alive error",
 				zap.String("acc", account.Auth.Email),
 				zap.Error(err))
 		} else {
-			response := res.String()
-			if isSessionExpired(response) {
+			var keepAliveResp request.KeepAliveResponse
+			if err := json.Unmarshal(res.Body(), &keepAliveResp); err == nil {
+				logger.Info("Keep alive",
+					zap.String("acc", account.Auth.Email),
+					zap.Int("status", res.StatusCode()),
+					zap.String("message", keepAliveResp.Message))
+			}
+
+			if isSessionExpired(res.String()) {
 				logger.Warn("Session expired, attempting relogin",
 					zap.String("acc", account.Auth.Email))
 
@@ -776,15 +790,12 @@ func ping(account Account, userAgent string) {
 				}
 				continue
 			}
-
-			logger.Info("Keep alive success",
-				zap.String("acc", account.Auth.Email),
-				zap.String("res", cleanResponse(response)))
 		}
 
-		points, err := getPoints(client, account, appID)
+		points, err := getPoints(client, account, account.AppID)
 		if err != nil {
-			if _, ok := err.(*SessionExpiredError); ok {
+			var sessionExpiredError *SessionExpiredError
+			if errors.As(err, &sessionExpiredError) {
 				logger.Warn("Session expired during points check, attempting to relogin",
 					zap.String("acc", account.Auth.Email))
 
@@ -814,6 +825,7 @@ func ping(account Account, userAgent string) {
 
 			logger.Error("Error calculating points",
 				zap.String("acc", account.Auth.Email),
+				zap.Int("statusCode", res.StatusCode()),
 				zap.Error(err))
 		} else {
 			logger.Info("Points calculated",
