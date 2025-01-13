@@ -1162,26 +1162,29 @@ func main() {
 			zap.String("email", accounts[i].Auth.Email),
 			zap.String("loginProxy", accounts[i].LoginProxy))
 
-		err := processLogin(&accounts[i])
-		if err != nil {
-			if isInvalidCredentials(err) {
-				logger.Error("Skipping account due to invalid credentials",
-					zap.String("email", accounts[i].Auth.Email))
-				skippedAccounts++
+		for {
+			err := processLogin(&accounts[i])
+			if err != nil {
+				if isInvalidCredentials(err) {
+					logger.Error("Skipping account due to invalid credentials",
+						zap.String("email", accounts[i].Auth.Email))
+					skippedAccounts++
+					break
+				}
+				logger.Error("Failed to process login, retrying...",
+					zap.String("email", accounts[i].Auth.Email),
+					zap.Error(err))
+				time.Sleep(3 * time.Second)
 				continue
 			}
 
-			logger.Error("Failed to process login",
+			successfulLogins++
+			logger.Info("Account login successful",
 				zap.String("email", accounts[i].Auth.Email),
-				zap.Error(err))
-			continue
+				zap.Int("successfulLogins", successfulLogins),
+				zap.Int("totalAccounts", len(accounts)))
+			break
 		}
-
-		successfulLogins++
-		logger.Info("Account login successful",
-			zap.String("email", accounts[i].Auth.Email),
-			zap.Int("successfulLogins", successfulLogins),
-			zap.Int("totalAccounts", len(accounts)))
 	}
 
 	logger.Info("Login process completed",
