@@ -633,7 +633,7 @@ func calculateTotalPoints(jsonResponse string) (float64, error) {
 	}
 
 	if !response.Status {
-		return 0, fmt.Errorf("error fetching points: %s", response.Message)
+		return 0, fmt.Errorf("error fetching points ")
 	}
 
 	totalPoints := response.Data.RewardPoint.Points +
