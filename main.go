@@ -824,16 +824,16 @@ func ping(account Account, userAgent string) {
 			}
 
 			logger.Error("Error calculating points",
-				zap.String("acc", account.Auth.Email),
-				zap.Int("statusCode", res.StatusCode()),
-				zap.Error(err))
+				zap.String("acc", account.Auth.Email))
+			//zap.Int("statusCode", res.StatusCode()),
+			//zap.Error(err))
 		} else {
 			logger.Info("Points calculated",
 				zap.String("acc", account.Auth.Email),
 				zap.String("points", formatReadablePoints(points)))
 		}
 
-		time.Sleep(1 * time.Minute)
+		time.Sleep(30 * time.Second)
 	}
 }
 
@@ -899,8 +899,16 @@ func handlePoint(ctx context.Context, b *bot.Bot, update *models.Update, account
 		}
 		return
 	}
-
 	logUserInteraction(update, "requested point information")
+
+	// bot send reply first
+	if _, err := b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   "We got your request, please wait ...",
+	}); err != nil {
+		log.Printf("Error sending got request message : %v", err)
+	}
+
 	sendTelegramNotification(ctx, b, update.Message.Chat.ID, accounts)
 }
 
