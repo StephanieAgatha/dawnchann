@@ -11,8 +11,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/briandowns/spinner"
 	browser "github.com/itzngga/fake-useragent"
 	"github.com/joho/godotenv"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpproxy"
 	"io"
 	"log"
 	"math"
@@ -23,8 +26,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/andybalholm/brotli"
-	"github.com/go-resty/resty/v2"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"github.com/mattn/go-colorable"
@@ -32,12 +33,19 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-var logger *zap.Logger
-
 var (
+	logger          *zap.Logger
+	spinnerInstance *spinner.Spinner
+	outputLock      = make(chan struct{}, 1)
+
 	extensionID = "fpdkjdnhkakefebpekbdhillbhonfjjp"
 	chromeUA    = browser.Chrome()
 )
+
+// init
+func init() {
+	outputLock <- struct{}{}
+}
 
 type Account struct {
 	Auth       request.Authentication
@@ -59,6 +67,61 @@ type ProxyDistributor struct {
 	proxies []string
 	logger  *zap.Logger
 	mu      sync.Mutex
+}
+
+type syncWriter struct {
+	output zapcore.WriteSyncer
+}
+
+func (w *syncWriter) Write(p []byte) (n int, err error) {
+	<-outputLock
+	defer func() { outputLock <- struct{}{} }()
+
+	fmt.Print("\r\033[K") // clear line before writing log
+	return w.output.Write(p)
+}
+
+func (w *syncWriter) Sync() error {
+	return w.output.Sync()
+}
+
+func spin(duration time.Duration) {
+	<-outputLock // acquire lock
+
+	if spinnerInstance == nil {
+		spinnerInstance = spinner.New(spinner.CharSets[36], 100*time.Millisecond)
+		spinnerInstance.Color("yellow")
+		spinnerInstance.Suffix = " Waiting..."
+	}
+
+	fmt.Print("\r\033[K") // clear line before starting
+	spinnerInstance.Start()
+	time.Sleep(duration)
+	spinnerInstance.Stop()
+	fmt.Print("\r\033[K") // clear line after stopping
+
+	outputLock <- struct{}{} // release lock
+}
+
+func initLogger() *zap.Logger {
+	config := zap.NewDevelopmentEncoderConfig()
+	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	originalOutput := zapcore.AddSync(colorable.NewColorableStdout())
+	locker := zapcore.Lock(zapcore.AddSync(&syncWriter{output: originalOutput}))
+
+	config.EncodeTime = func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
+		jakarta, err := time.LoadLocation("Asia/Jakarta")
+		if err != nil {
+			jakarta = time.UTC
+		}
+		enc.AppendString(t.In(jakarta).Format("02/01/2006 15:04:05"))
+	}
+
+	return zap.New(zapcore.NewCore(
+		zapcore.NewConsoleEncoder(config),
+		locker,
+		zapcore.DebugLevel,
+	))
 }
 
 func (pd *ProxyDistributor) Validate() error {
@@ -222,17 +285,53 @@ func readProxies(path string) ([]string, error) {
 	return proxies, scanner.Err()
 }
 
-func getHeaders(extensionID string) map[string]string {
-	return map[string]string{
-		"Accept":          "*/*",
-		"Accept-Encoding": "gzip, deflate, br, zstd",
-		"Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-		"User-Agent":      chromeUA,
-		"Sec-Fetch-Dest":  "empty",
-		"Sec-Fetch-Mode":  "cors",
-		"Sec-Fetch-Site":  "cross-site",
-		"Content-Type":    "application/json",
-		"Origin":          fmt.Sprintf("chrome-extension://%s", extensionID),
+// do req using fasthttp
+func doRequest(client *fasthttp.Client, method, url string, body []byte, headers map[string]string, timeout time.Duration) ([]byte, int, error) {
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(url)
+	req.Header.SetMethod(method)
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	if body != nil {
+		req.SetBody(body)
+	}
+
+	if err := client.DoTimeout(req, resp, timeout); err != nil {
+		return nil, 0, err
+	}
+
+	bodyBytes := resp.Body()
+	if len(bodyBytes) > 0 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b {
+		reader, err := gzip.NewReader(bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, resp.StatusCode(), fmt.Errorf("failed to create gzip reader: %v", err)
+		}
+		defer reader.Close()
+
+		bodyBytes, err = io.ReadAll(reader)
+		if err != nil {
+			return nil, resp.StatusCode(), fmt.Errorf("failed to read gzipped content: %v", err)
+		}
+	}
+
+	return bodyBytes, resp.StatusCode(), nil
+}
+
+// fasthttp client
+func createClient(proxy string) *fasthttp.Client {
+	return &fasthttp.Client{
+		TLSConfig: &tls.Config{
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+		},
+		Dial: fasthttpproxy.FasthttpHTTPDialer(proxy),
 	}
 }
 
@@ -247,34 +346,45 @@ func generateappID() string {
 	return string(result)
 }
 
+// base header
+func getBaseHeaders(userAgent string) map[string]string {
+	return map[string]string{
+		"accept":          "*/*",
+		"accept-language": "en-US,en;q=0.9",
+		"accept-encoding": "gzip",
+		"content-type":    "application/json",
+		"user-agent":      userAgent,
+	}
+}
+
 // get puzzle
 func getPuzzleID(proxy string) (string, string, error) {
 	appID := generateappID()
 	logger.Info("app id generated", zap.String("appid", appID))
 
-	client := resty.New().
-		SetTimeout(30 * time.Second).
-		SetRetryCount(3).
-		SetRetryWaitTime(5 * time.Second).
-		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
-		SetProxy(proxy)
+	client := createClient(proxy)
+	headers := getBaseHeaders(chromeUA)
+	headers["origin"] = fmt.Sprintf("chrome-extension://%s", extensionID)
 
-	headers := getHeaders(extensionID)
-
-	resp, err := client.R().
-		SetHeaders(headers).
-		Get("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle?appid=" + appID)
+	body, statusCode, err := doRequest(
+		client,
+		fasthttp.MethodGet,
+		"https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle?appid="+appID,
+		nil,
+		headers,
+		30*time.Second,
+	)
 
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get puzzle: %v", err)
 	}
 
-	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
-		return "", "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	if statusCode != 200 && statusCode != 201 {
+		return "", "", fmt.Errorf("unexpected status code: %d", statusCode)
 	}
 
 	var puzzleResp request.PuzzleResponse
-	if err := json.Unmarshal(resp.Body(), &puzzleResp); err != nil {
+	if err := json.Unmarshal(body, &puzzleResp); err != nil {
 		return "", "", fmt.Errorf("failed to parse puzzle response: %v", err)
 	}
 
@@ -287,31 +397,28 @@ func getPuzzleID(proxy string) (string, string, error) {
 }
 
 func getPuzzleImage(puzzleID, appID, userAgent string, proxy string) (string, error) {
-	client := resty.New().
-		SetTimeout(30 * time.Second).
-		SetRetryCount(3).
-		SetRetryWaitTime(5 * time.Second).
-		SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
-		SetProxy(proxy).
-		SetHeaders(map[string]string{
-			"accept":          "*/*",
-			"accept-language": "en-US,en;q=0.9",
-			"user-agent":      userAgent,
-		})
+	client := createClient(proxy)
+	headers := getBaseHeaders(userAgent)
 
-	url := fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle-image?puzzle_id=%s&appid=%s", puzzleID, appID)
-	resp, err := client.R().Get(url)
+	body, statusCode, err := doRequest(
+		client,
+		fasthttp.MethodGet,
+		fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle-image?puzzle_id=%s&appid=%s", puzzleID, appID),
+		nil,
+		headers,
+		30*time.Second,
+	)
 
 	if err != nil {
 		return "", fmt.Errorf("failed to get puzzle image: %v", err)
 	}
 
-	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	if statusCode != 200 && statusCode != 201 {
+		return "", fmt.Errorf("unexpected status code: %d", statusCode)
 	}
 
 	var imageResp request.PuzzleImageResponse
-	if err := json.Unmarshal(resp.Body(), &imageResp); err != nil {
+	if err := json.Unmarshal(body, &imageResp); err != nil {
 		return "", fmt.Errorf("failed to parse image response: %v", err)
 	}
 
@@ -376,25 +483,39 @@ func createCaptchaTask(apiKey, imgBase64 string) (int64, error) {
 		},
 	}
 
-	client := resty.New().
-		SetTimeout(30 * time.Second).
-		SetRetryCount(3).
-		SetRetryWaitTime(5 * time.Second)
+	client := &fasthttp.Client{
+		MaxIdleConnDuration: 30 * time.Second,
+	}
 
-	resp, err := client.R().
-		SetBody(payload).
-		Post(constant.TwoCaptchaURL + "/createTask")
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       "application/json",
+	}
+
+	body, statusCode, err := doRequest(
+		client,
+		fasthttp.MethodPost,
+		constant.TwoCaptchaURL+"/createTask",
+		payloadBytes,
+		headers,
+		30*time.Second,
+	)
 
 	if err != nil {
 		return 0, fmt.Errorf("failed to create captcha task: %v", err)
 	}
 
-	if resp.StatusCode() != 200 {
-		return 0, fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	if statusCode != 200 {
+		return 0, fmt.Errorf("unexpected status code: %d", statusCode)
 	}
 
 	var result request.CreateTaskResponse
-	if err := json.Unmarshal(resp.Body(), &result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		return 0, fmt.Errorf("failed to parse create task response: %v", err)
 	}
 
@@ -412,26 +533,40 @@ func getCaptchaResult(apiKey string, taskID int64) (string, error) {
 		TaskID:    taskID,
 	}
 
-	client := resty.New().
-		SetTimeout(30 * time.Second).
-		SetRetryCount(3).
-		SetRetryWaitTime(5 * time.Second)
+	client := &fasthttp.Client{
+		MaxIdleConnDuration: 30 * time.Second,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal payload: %v", err)
+	}
+
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"Accept":       "application/json",
+	}
 
 	for attempt := 0; attempt < constant.MaxRetries; attempt++ {
-		resp, err := client.R().
-			SetBody(payload).
-			Post(constant.TwoCaptchaURL + "/getTaskResult")
+		body, statusCode, err := doRequest(
+			client,
+			fasthttp.MethodPost,
+			constant.TwoCaptchaURL+"/getTaskResult",
+			payloadBytes,
+			headers,
+			30*time.Second,
+		)
 
 		if err != nil {
 			return "", fmt.Errorf("failed to get captcha result: %v", err)
 		}
 
-		if resp.StatusCode() != 200 {
-			return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+		if statusCode != 200 {
+			return "", fmt.Errorf("unexpected status code: %d", statusCode)
 		}
 
 		var result request.GetResultResponse
-		if err := json.Unmarshal(resp.Body(), &result); err != nil {
+		if err := json.Unmarshal(body, &result); err != nil {
 			return "", fmt.Errorf("failed to parse result response: %v", err)
 		}
 
@@ -448,7 +583,7 @@ func getCaptchaResult(apiKey string, taskID int64) (string, error) {
 			logger.Info("Captcha still processing, waiting...",
 				zap.Int("attempt", attempt+1),
 				zap.Int("maxAttempts", constant.MaxRetries))
-			time.Sleep(constant.RetryInterval)
+			spin(constant.RetryInterval)
 		}
 	}
 
@@ -458,10 +593,6 @@ func getCaptchaResult(apiKey string, taskID int64) (string, error) {
 // login
 func processLogin(account *Account) error {
 	maxRetries := 50
-
-	logger.Info("Using dedicated proxy for login process",
-		zap.String("email", account.Auth.Email),
-		zap.String("proxy", account.LoginProxy))
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		puzzleID, solution, appID, err := solvePuzzle(account.Auth.Email, account.LoginProxy)
@@ -473,7 +604,7 @@ func processLogin(account *Account) error {
 				zap.Error(err))
 
 			if attempt < maxRetries-1 {
-				time.Sleep(3 * time.Second)
+				spin(3 * time.Second)
 				continue
 			}
 			return fmt.Errorf("failed to solve puzzle after %d attempts: %v", maxRetries, err)
@@ -504,7 +635,7 @@ func processLogin(account *Account) error {
 					logger.Info("Waiting before retry...",
 						zap.String("email", account.Auth.Email),
 						zap.Int("nextAttempt", attempt+2))
-					time.Sleep(3 * time.Second)
+					spin(3 * time.Second)
 					continue
 				}
 			} else if strings.Contains(err.Error(), "Incorrect answer") {
@@ -514,7 +645,7 @@ func processLogin(account *Account) error {
 					zap.String("solution", solution))
 
 				if attempt < maxRetries-1 {
-					time.Sleep(2 * time.Second)
+					spin(2 * time.Second)
 					continue
 				}
 			}
@@ -547,71 +678,35 @@ func loginDawn(email, password, puzzleID, captchaSolution, appID, proxy string) 
 	}
 
 	userAgent := browser.Chrome()
+	client := createClient(proxy)
+	headers := getBaseHeaders(userAgent)
+	headers["origin"] = "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp"
 
-	client := resty.New().
-		SetTimeout(2 * time.Minute).
-		SetRetryCount(3).
-		SetRetryWaitTime(5 * time.Second).
-		SetTLSClientConfig(&tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         tls.VersionTLS12,
-		}).
-		SetProxy(proxy).
-		SetHeaders(map[string]string{
-			"accept":          "*/*",
-			"accept-language": "en-US,en;q=0.9",
-			"content-type":    "application/json",
-			"origin":          "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-			"user-agent":      userAgent,
-		}).
-		SetDoNotParseResponse(true)
+	payload, err := json.Marshal(loginPayload)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal login payload: %v", err)
+	}
 
-	resp, err := client.R().
-		SetBody(loginPayload).
-		Post("https://www.aeropres.in/chromeapi/dawn/v1/user/login/v2?appid=" + appID)
+	body, statusCode, err := doRequest(
+		client,
+		fasthttp.MethodPost,
+		"https://www.aeropres.in/chromeapi/dawn/v1/user/login/v2?appid="+appID,
+		payload,
+		headers,
+		2*time.Minute,
+	)
 
 	if err != nil {
 		return "", fmt.Errorf("login request failed: %v", err)
 	}
-	defer resp.RawBody().Close()
 
-	bodyBytes, err := io.ReadAll(resp.RawBody())
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	if len(bodyBytes) > 0 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b {
-		reader, err := gzip.NewReader(bytes.NewReader(bodyBytes))
-		if err != nil {
-			return "", fmt.Errorf("failed to create gzip reader: %v", err)
-		}
-		defer reader.Close()
-
-		bodyBytes, err = io.ReadAll(reader)
-		if err != nil {
-			return "", fmt.Errorf("failed to read gzipped content: %v", err)
-		}
-	}
-
-	if strings.Contains(resp.Header().Get("Content-Encoding"), "br") {
-		reader := brotli.NewReader(bytes.NewReader(bodyBytes))
-		decompressed, err := io.ReadAll(reader)
-		if err != nil {
-			return "", fmt.Errorf("failed to decompress brotli content: %v", err)
-		}
-		bodyBytes = decompressed
-	}
-
-	logger.Info("Login raw response", zap.Int("statusCode", resp.StatusCode()))
-
-	if resp.StatusCode() != 200 && resp.StatusCode() != 201 {
-		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	if statusCode != 200 && statusCode != 201 {
+		return "", fmt.Errorf("unexpected status code: %d", statusCode)
 	}
 
 	var loginResp request.LoginResponse
-	if err := json.Unmarshal(bodyBytes, &loginResp); err != nil {
-		return "", fmt.Errorf("failed to parse login response: %v, raw: %s",
-			err, string(bodyBytes))
+	if err := json.Unmarshal(body, &loginResp); err != nil {
+		return "", fmt.Errorf("failed to parse login response: %v, raw: %s", err, string(body))
 	}
 
 	if !loginResp.Status {
@@ -690,16 +785,28 @@ func humanizeFloat(f float64) string {
 }
 
 // get points
-func getPoints(client *resty.Client, account Account, appID string) (float64, error) {
-	res, err := client.R().
-		SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
-		Get("https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid=" + appID)
+func getPoints(client *fasthttp.Client, account Account, appID string) (float64, error) {
+	headers := getBaseHeaders(browser.Chrome())
+	headers["authorization"] = fmt.Sprintf("Bearer %v", account.Token)
+
+	body, statusCode, err := doRequest(
+		client,
+		fasthttp.MethodGet,
+		"https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid="+appID,
+		nil,
+		headers,
+		30*time.Second,
+	)
 
 	if err != nil {
 		return 0, err
 	}
 
-	response := res.String()
+	if statusCode != 200 && statusCode != 201 {
+		return 0, fmt.Errorf("unexpected status code: %d", statusCode)
+	}
+
+	response := string(body)
 	if isSessionExpired(response) {
 		return 0, &SessionExpiredError{Message: "Session expired during points check"}
 	}
@@ -715,28 +822,22 @@ func getPoints(client *resty.Client, account Account, appID string) (float64, er
 // ping
 func ping(account Account, userAgent string) {
 	currentProxyIndex := 0
-	maxRetries := 5
 
 	for {
 		proxy := account.Proxies[currentProxyIndex]
 		currentProxyIndex = (currentProxyIndex + 1) % len(account.Proxies)
 
-		client := resty.New().
-			SetTimeout(30 * time.Second).
-			SetRetryCount(3).
-			SetRetryWaitTime(5 * time.Second).
-			SetTLSClientConfig(&tls.Config{
+		client := &fasthttp.Client{
+			TLSConfig: &tls.Config{
 				InsecureSkipVerify: true,
 				MinVersion:         tls.VersionTLS12,
-			}).
-			SetProxy(proxy).
-			SetHeaders(map[string]string{
-				"accept":          "*/*",
-				"accept-language": "en-US,en;q=0.9",
-				"content-type":    "application/json",
-				"origin":          fmt.Sprintf("chrome-extension://%s", extensionID),
-				"user-agent":      userAgent,
-			})
+			},
+			Dial: fasthttpproxy.FasthttpHTTPDialer(proxy),
+		}
+
+		headers := getBaseHeaders(userAgent)
+		headers["authorization"] = fmt.Sprintf("Bearer %v", account.Token)
+		headers["origin"] = fmt.Sprintf("chrome-extension://%s", extensionID)
 
 		keepAliveRequest := map[string]interface{}{
 			"username":     account.Auth.Email,
@@ -745,99 +846,133 @@ func ping(account Account, userAgent string) {
 			"_v":           "1.1.2",
 		}
 
-		res, err := client.R().
-			SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
-			SetBody(keepAliveRequest).
-			Post(fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive?appid=%s", account.AppID))
+		payload, err := json.Marshal(keepAliveRequest)
+		if err != nil {
+			logger.Error("Failed to marshal keepalive request", zap.Error(err))
+			continue
+		}
+
+		body, statusCode, err := doRequest(
+			client,
+			fasthttp.MethodPost,
+			fmt.Sprintf("https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive?appid=%s", account.AppID),
+			payload,
+			headers,
+			30*time.Second,
+		)
 
 		if err != nil {
 			logger.Error("Keep alive error",
 				zap.String("acc", account.Auth.Email),
 				zap.Error(err))
-		} else {
-			var keepAliveResp request.KeepAliveResponse
-			if err := json.Unmarshal(res.Body(), &keepAliveResp); err == nil {
-				logger.Info("Keep alive",
+			continue
+		}
+
+		var keepAliveResp request.KeepAliveResponse
+		if err := json.Unmarshal(body, &keepAliveResp); err == nil {
+			if statusCode != 200 && statusCode != 201 {
+				logger.Error("Keep alive failed",
 					zap.String("acc", account.Auth.Email),
-					zap.Int("status", res.StatusCode()),
+					zap.Int("status", statusCode),
+					zap.String("message", keepAliveResp.Message))
+			} else {
+				logger.Info("Keep alive success",
+					zap.String("acc", account.Auth.Email),
+					//zap.Int("status", statusCode),
 					zap.String("message", keepAliveResp.Message))
 			}
+		}
 
-			if isSessionExpired(res.String()) {
-				logger.Warn("Session expired, attempting relogin",
-					zap.String("acc", account.Auth.Email))
+		if isSessionExpired(string(body)) {
+			logger.Warn("Session expired, attempting relogin",
+				zap.String("acc", account.Auth.Email))
 
-				for retry := 0; retry < maxRetries; retry++ {
-					err := processLogin(&account)
-					if err != nil {
-						logger.Error("Relogin attempt failed",
-							zap.String("acc", account.Auth.Email),
-							zap.Int("attempt", retry+1),
-							zap.Int("maxAttempts", maxRetries),
-							zap.Error(err))
-
-						if retry < maxRetries-1 {
-							time.Sleep(3 * time.Second)
-							continue
-						}
-						break
-					}
-
-					logger.Info("Relogin successful",
-						zap.String("acc", account.Auth.Email),
-						zap.Int("attemptsTaken", retry+1))
-					break
-				}
+			if err := processLogin(&account); err != nil {
+				logger.Error("Relogin attempt failed",
+					zap.String("acc", account.Auth.Email),
+					zap.Error(err))
 				continue
 			}
+
+			logger.Info("Relogin successful",
+				zap.String("acc", account.Auth.Email))
+			continue
 		}
 
 		points, err := getPoints(client, account, account.AppID)
 		if err != nil {
 			var sessionExpiredError *SessionExpiredError
 			if errors.As(err, &sessionExpiredError) {
-				logger.Warn("Session expired during points check, attempting to relogin",
+				logger.Warn("Session expired during points check",
 					zap.String("acc", account.Auth.Email))
 
-				for retry := 0; retry < maxRetries; retry++ {
-					err := processLogin(&account)
-					if err != nil {
-						logger.Error("Relogin attempt failed during points check",
-							zap.String("acc", account.Auth.Email),
-							zap.Int("attempt", retry+1),
-							zap.Int("maxAttempts", maxRetries),
-							zap.Error(err))
-
-						if retry < maxRetries-1 {
-							time.Sleep(3 * time.Second)
-							continue
-						}
-						break
-					}
-
-					logger.Info("Relogin successful after points check error",
+				if err := processLogin(&account); err != nil {
+					logger.Error("Relogin attempt failed",
 						zap.String("acc", account.Auth.Email),
-						zap.Int("attemptsTaken", retry+1))
-					break
+						zap.Error(err))
 				}
 				continue
 			}
 
 			logger.Error("Error calculating points",
-				zap.String("acc", account.Auth.Email))
-			//zap.Int("statusCode", res.StatusCode()),
-			//zap.Error(err))
+				zap.String("acc", account.Auth.Email),
+				zap.Error(err))
 		} else {
 			logger.Info("Points calculated",
 				zap.String("acc", account.Auth.Email),
 				zap.String("points", formatReadablePoints(points)))
 		}
 
-		time.Sleep(30 * time.Second)
+		spin(30 * time.Second)
 	}
 }
 
 // telegram logic
+func initTeleBot(botToken string, accounts []Account) {
+	maxRetries := 5
+	retryDelay := 5 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		logger.Info("Initializing Telegram bot...",
+			zap.Int("attempt", attempt),
+			zap.Int("maxAttempts", maxRetries))
+
+		b, err := bot.New(botToken)
+		if err != nil {
+			if attempt == maxRetries {
+				logger.Error("Failed to initialize Telegram bot after all retries",
+					zap.Int("attempts", attempt),
+					zap.Error(err))
+				return
+			}
+
+			logger.Warn("Failed to initialize Telegram bot, retrying...",
+				zap.Int("attempt", attempt),
+				zap.Int("maxAttempts", maxRetries),
+				zap.Duration("retryDelay", retryDelay),
+				zap.Error(err))
+
+			time.Sleep(retryDelay)
+			retryDelay *= 2
+			continue
+		}
+
+		// Successfully initialized bot
+		b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, handleStart)
+		b.RegisterHandler(bot.HandlerTypeMessageText, "/point", bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
+			handlePoint(ctx, b, update, accounts)
+		})
+
+		logger.Info("Successfully initialized Telegram bot",
+			zap.Int("attemptsTaken", attempt))
+
+		logger.Info("Starting Telegram bot")
+		b.Start(context.Background())
+		return
+	}
+}
+
+// authorized chat
 func isAuthorizedChat(chatID int64) bool {
 	allowedChatID := os.Getenv("CHAT_ID")
 	if allowedChatID == "" {
@@ -962,27 +1097,22 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 			proxy := account.Proxies[attempt%len(account.Proxies)]
 			userAgent := browser.Chrome()
 
-			client := resty.New().
-				SetTimeout(30 * time.Second).
-				SetRetryCount(3).
-				SetRetryWaitTime(5 * time.Second).
-				SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true}).
-				SetProxy(proxy).
-				SetHeaders(map[string]string{
-					"content-type":    "application/json",
-					"origin":          "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-					"accept":          "*/*",
-					"accept-language": "en-US,en;q=0.9",
-					"priority":        "u=1, i",
-					"sec-fetch-dest":  "empty",
-					"sec-fetch-mode":  "cors",
-					"sec-fetch-site":  "cross-site",
-					"user-agent":      userAgent,
-				})
+			client := &fasthttp.Client{
+				TLSConfig: &tls.Config{InsecureSkipVerify: true},
+				Dial:      fasthttpproxy.FasthttpHTTPDialer(proxy),
+			}
 
-			res, err := client.R().
-				SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
-				Get("https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid=" + generateappID())
+			headers := getBaseHeaders(userAgent)
+			headers["authorization"] = fmt.Sprintf("Bearer %v", account.Token)
+
+			body, _, err := doRequest(
+				client,
+				fasthttp.MethodGet,
+				"https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid="+generateappID(),
+				nil,
+				headers,
+				30*time.Second,
+			)
 
 			if err != nil {
 				logger.Error("Failed to fetch points",
@@ -991,7 +1121,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 					zap.Error(err))
 
 				if attempt < maxAttempts-1 {
-					time.Sleep(2 * time.Second)
+					spin(2 * time.Second)
 					continue
 				}
 
@@ -1000,7 +1130,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 				break
 			}
 
-			response := res.String()
+			response := string(body)
 
 			if isSessionExpired(response) || strings.Contains(response, "Provider routines") {
 				logger.Warn("Session issue detected, attempting relogin",
@@ -1012,7 +1142,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 						zap.String("account", maskEmail(account.Auth.Email)),
 						zap.Error(err))
 					if attempt < maxAttempts-1 {
-						time.Sleep(2 * time.Second)
+						spin(2 * time.Second)
 						continue
 					}
 					messageLines = append(messageLines, fmt.Sprintf("%s\n❌ Error: Relogin failed\n",
@@ -1020,14 +1150,20 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 					break
 				}
 
-				res, err = client.R().
-					SetHeader("authorization", fmt.Sprintf("Bearer %v", account.Token)).
-					Get("https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid=" + generateappID())
+				headers["authorization"] = fmt.Sprintf("Bearer %v", account.Token)
+				body, _, err = doRequest(
+					client,
+					fasthttp.MethodGet,
+					"https://www.aeropres.in/api/atom/v1/userreferral/getpoint?appid="+generateappID(),
+					nil,
+					headers,
+					30*time.Second,
+				)
 
 				if err != nil {
 					continue
 				}
-				response = res.String()
+				response = string(body)
 			}
 
 			points, pointsErr = calculateTotalPoints(response)
@@ -1036,7 +1172,7 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 			}
 
 			if attempt < maxAttempts-1 {
-				time.Sleep(2 * time.Second)
+				spin(2 * time.Second)
 				continue
 			}
 		}
@@ -1096,20 +1232,14 @@ func sendTelegramNotification(ctx context.Context, b *bot.Bot, chatID int64, acc
 			logger.Warn("Failed to send telegram message, retrying...",
 				zap.Int("attempt", attempt),
 				zap.Error(err))
-			time.Sleep(time.Second * time.Duration(attempt))
+			spin(time.Second * time.Duration(attempt))
 		}
 	}
 }
 
 func main() {
 	// init logger
-	config := zap.NewDevelopmentEncoderConfig()
-	config.EncodeLevel = zapcore.CapitalColorLevelEncoder
-	logger = zap.New(zapcore.NewCore(
-		zapcore.NewConsoleEncoder(config),
-		zapcore.AddSync(colorable.NewColorableStdout()),
-		zapcore.DebugLevel,
-	))
+	logger = initLogger()
 
 	//load .env file
 	if err := godotenv.Load(); err != nil {
@@ -1182,7 +1312,7 @@ func main() {
 				logger.Error("Failed to process login, retrying...",
 					zap.String("email", accounts[i].Auth.Email),
 					zap.Error(err))
-				time.Sleep(3 * time.Second)
+				spin(3 * time.Second)
 				continue
 			}
 
@@ -1222,20 +1352,7 @@ func main() {
 
 	// init telegram bot only if enabled
 	if telegramEnabled {
-		logger.Info("Initializing Telegram bot...")
-		b, err := bot.New(botToken)
-		if err != nil {
-			logger.Error("Error creating Telegram bot, continuing without bot", zap.Error(err))
-		} else {
-			// telegram handlers
-			b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, handleStart)
-			b.RegisterHandler(bot.HandlerTypeMessageText, "/point", bot.MatchTypeExact, func(ctx context.Context, b *bot.Bot, update *models.Update) {
-				handlePoint(ctx, b, update, accounts)
-			})
-
-			logger.Info("Starting Telegram bot")
-			b.Start(context.Background())
-		}
+		initTeleBot(botToken, accounts)
 	}
 
 	// if telegram is disabled or failed to start, keep the program running
